@@ -275,9 +275,9 @@ __global__ void mapKernel(
   // 5. Calculate the position of element in out_array according to out_index and out_strides
   // 6. Apply the unary function to the input element and write the output to the out memory
 
-  const int blockIndex = blockIdx.x + blockIdx.y * gridDims.x + blockIdx.z * gridDims.x*gridDims.y;
-  const int blockSize = blockDims.x * blockDims.y * blockDims.z;
-  const int threadIndex = threadIdx.x + threadIdx.y * blockDims.x + threadIdx.z * blockDims.x*blockDims.y;
+  const int blockIndex = blockIdx.x + blockIdx.y * gridDim.x + blockIdx.z * gridDim.x*gridDim.y;
+  const int blockSize = blockDim.x * blockDim.y * blockDim.z;
+  const int threadIndex = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x*blockDim.y;
   const int out_position = blockIndex * blockSize + threadIndex;
 
   if(out_position < out_size){
@@ -353,9 +353,9 @@ __global__ void zipKernel(
   // 7.Calculate the position of element in b_array according to b_index and b_strides
   // 8. Apply the binary function to the input elements in a_array & b_array and write the output to the out memory
 
-  const int blockIndex = blockIdx.x + blockIdx.y * gridDims.x + blockIdx.z * gridDims.x*gridDims.y;
-  const int blockSize = blockDims.x * blockDims.y * blockDims.z;
-  const int threadIndex = threadIdx.x + threadIdx.y * blockDims.x + threadIdx.z * blockDims.x*blockDims.y;
+  const int blockIndex = blockIdx.x + blockIdx.y * gridDim.x + blockIdx.z * gridDim.x*gridDim.y;
+  const int blockSize = blockDim.x * blockDim.y * blockDim.z;
+  const int threadIndex = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x*blockDim.y;
   const int out_position = blockIndex * blockSize + threadIndex;
 
   if(out_position < out_size){
@@ -413,7 +413,7 @@ __global__ void reduceKernel(
    *  None (Fills in out array)
    */
 
-  // __shared__ double cache[BLOCK_DIM]; // Uncomment this line if you want to use shared memory to store partial results
+  extern __shared__ double cache[]; // Uncomment this line if you want to use shared memory to store partial results
   int out_index[MAX_DIMS];
 
   /// BEGIN HW1_3
@@ -424,7 +424,37 @@ __global__ void reduceKernel(
   // 4. Iterate over the reduce_dim dimension of the input array to compute the reduced value
   // 5. Write the reduced value to out memory
 
-  assert(false && "Not Implemented");
+  const int threadIndex = threadIdx.x;
+  const int blockIndex = blockIdx.x;
+  const int blockSize = blockDim.x;
+
+  if(blockIndex < out_size){
+    const int reduceSize = a_shape[reduce_dim];
+    float tempValue = reduce_value;
+
+    // Load in
+    to_index(blockIndex, out_shape, out_index, shape_size);
+    for(int i = threadIndex; i < reduceSize; i += blockSize){
+      out_index[reduce_dim] = i;
+      const int accessIndex = index_to_position(out_index, a_strides, shape_size);
+      tempValue = fn(fn_id, tempValue, a_storage[accessIndex]);
+    }
+    cache[threadIndex] = tempValue;
+    __syncthreads();
+
+    // Tree Reduce
+    for(int s = (blockSize >> 1); s; s >>= 1){
+      if(threadIndex < s){
+        cache[threadIndex] = fn(fn_id, cache[threadIndex], cache[threadIndex + s]);
+      }
+      __syncthreads();
+    }
+
+    if(threadIndex == 0){
+      out[blockIndex] = cache[0];
+    }
+  }
+
   /// END HW1_3
 }
 
@@ -484,7 +514,34 @@ __global__ void MatrixMultiplyKernel(
   // 6. Synchronize to make sure all threads are done computing the output tile for (row, col)
   // 7. Write the output to global memory
 
-  assert(false && "Not Implemented");
+  const int K = a_shape[2], M = a_shape[1], N = b_shape[2];
+  if (blockIdx.x * TILE >= M || blockIdx.y * TILE >= N) return;
+  a_storage += a_batch_stride * batch + blockIdx.x * TILE * K;
+  b_storage += b_batch_stride * batch + blockIdx.y * TILE;
+  const int t_i = threadIdx.y, t_j = threadIdx.x;
+  out += out_strides[0] * batch + blockIdx.x * TILE * N + blockIdx.y * TILE + t_i * N + t_j;
+  const int row = blockIdx.x * TILE + t_i, col = blockIdx.y * TILE + t_j;
+
+  if(row < M && col < N){
+    float tempValue = 0.0;
+    for(int tileCount = 0; tileCount < K; tileCount += TILE){
+      a_shared[t_i][t_j] = (tileCount + t_j < K) ? a_storage[t_i * K + t_j] : 0.0;
+      b_shared[t_i][t_j] = (tileCount + t_i < K) ? b_storage[t_i * N + t_j] : 0.0;
+
+      __syncthreads();
+
+      for(int k = 0; k < TILE; ++k){
+        tempValue += a_shared[t_i][k] * b_shared[k][t_j];
+      }
+
+      __syncthreads();
+
+      a_storage += TILE;
+      b_storage += TILE * N;
+    }
+    *out = tempValue;
+  }
+
   /// END HW1_4
 }
 
@@ -727,8 +784,9 @@ extern "C"
 
     // Launch kernel
     int threadsPerBlock = 32;
-    int blocksPerGrid = (out_size + threadsPerBlock - 1) / threadsPerBlock;
-    reduceKernel<<<blocksPerGrid, threadsPerBlock>>>(
+    int blocksPerGrid = out_size
+    size_t SMEMPerBlock = threadsPerBlock * sizeof(float);
+    reduceKernel<<<blocksPerGrid, threadsPerBlock, SMEMPerBlock>>>(
         d_out, d_out_shape, d_out_strides, out_size,
         d_a, d_a_shape, d_a_strides,
         reduce_dim, reduce_value, shape_size, fn_id);
